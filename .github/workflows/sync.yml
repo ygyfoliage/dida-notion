@@ -23,8 +23,7 @@ jobs:
 
       - name: Run sync script
         env:
-          DIDA_USERNAME: ${{ secrets.DIDA_USERNAME }}
-          DIDA_PASSWORD: ${{ secrets.DIDA_PASSWORD }}
+          DIDA_ACCESS_TOKEN: ${{ secrets.DIDA_ACCESS_TOKEN }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: python sync.py
