@@ -1,186 +1,186 @@
+# sync.py
+# OAuth2 version - uses access_token from GitHub Secrets
+# Syncs Dida365 tasks with due date = today to Notion
+
 import requests
 from datetime import date
 from notion_client import Client
 import os
+import sys
 
 # ================================
-# 配置区域 - 从环境变量读取
+# Configuration from environment variables
 # ================================
-DIDA_USERNAME = os.environ.get("DIDA_USERNAME")   # 滴答清单 邮箱
-DIDA_PASSWORD = os.environ.get("DIDA_PASSWORD")   # 滴答清单 密码
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN")     # Notion API Token
-NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")  # Notion 数据库 ID
+DIDA_ACCESS_TOKEN = os.environ.get("DIDA_ACCESS_TOKEN")
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
 
-# ================================
-# Step 1: 登录滴答清单
-# ================================
-def login_dida():
-    session = requests.Session()
-    print("正在登录滴答清单...")
-
-    resp = session.post(
-        "https://api.dida365.com/api/v2/user/signon?wc=true&remember=true",
-        json={
-            "username": DIDA_USERNAME,
-            "password": DIDA_PASSWORD
-        },
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0"
-        }
-    )
-
-    if resp.status_code != 200:
-        raise Exception(f"登录失败，状态码: {resp.status_code}，返回: {resp.text}")
-
-    data = resp.json()
-    token = data.get("token")
-    if not token:
-        raise Exception(f"未获取到 token，返回内容: {data}")
-
-    print("✅ 登录成功")
-    return session, token
-
+# Validate required secrets
+if not all([DIDA_ACCESS_TOKEN, NOTION_TOKEN, NOTION_DATABASE_ID]):
+    print("Error: Missing required environment variables!")
+    print(f"  DIDA_ACCESS_TOKEN: {bool(DIDA_ACCESS_TOKEN)}")
+    print(f"  NOTION_TOKEN: {bool(NOTION_TOKEN)}")
+    print(f"  NOTION_DATABASE_ID: {bool(NOTION_DATABASE_ID)}")
+    sys.exit(1)
 
 # ================================
-# Step 2: 获取今日截止任务
+# Step 1: Get tasks from Dida365 using OAuth2
 # ================================
-def get_due_today_tasks(session, token):
-    today = date.today().isoformat()  # e.g. "2024-05-12"
-    print(f"正在获取截止日期为 {today} 的任务...")
+def get_due_today_tasks():
+    today = date.today().isoformat()  # e.g. "2026-05-12"
+    print(f"Fetching tasks due on {today}...")
 
     headers = {
-        "Cookie": f"t={token}",
-        "User-Agent": "Mozilla/5.0",
-        "x-device": '{"platform":"web","os":"macOS","device":"Chrome","name":"","version":4531,"id":"abcd1234","channel":"website","campaign":"","websocket":""}'
+        "Authorization": f"Bearer {DIDA_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
     }
 
-    resp = session.get(
-        "https://api.dida365.com/api/v2/batch/check/0",
-        headers=headers
-    )
+    try:
+        resp = requests.get(
+            "https://api.dida365.com/api/v2/batch/check/0",
+            headers=headers,
+            verify=False,
+            timeout=10
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"Network error: {e}")
+        sys.exit(1)
 
-    if resp.status_code != 200:
-        raise Exception(f"获取任务失败，状态码: {resp.status_code}")
+    if resp.status_code == 401:
+        print("Error: Access token expired or invalid!")
+        print("Please run get_token.py again to refresh the token.")
+        sys.exit(1)
+    elif resp.status_code != 200:
+        print(f"Error: Failed to fetch tasks. Status: {resp.status_code}")
+        print(f"Response: {resp.text}")
+        sys.exit(1)
 
-    all_tasks = resp.json().get("syncTaskBean", {}).get("update", [])
-    print(f"共获取到 {len(all_tasks)} 条任务，开始筛选今日截止...")
+    try:
+        all_tasks = resp.json().get("syncTaskBean", {}).get("update", [])
+    except ValueError:
+        print(f"Error: Invalid JSON response: {resp.text}")
+        sys.exit(1)
 
+    print(f"Total tasks fetched: {len(all_tasks)}")
+
+    # Filter tasks due today and not completed
     due_today = []
     for task in all_tasks:
-        due_date = task.get("dueDate", "")         # e.g. "2024-05-12T16:00:00.000+0000"
-        status = task.get("status", -1)             # 0 = 未完成, 2 = 已完成
+        due_date = task.get("dueDate", "")  # e.g. "2026-05-12T16:00:00.000+0000"
+        status = task.get("status", -1)      # 0 = incomplete, 2 = completed
         if due_date.startswith(today) and status == 0:
             due_today.append(task)
 
-    print(f"✅ 找到 {len(due_today)} 条今日截止任务")
+    print(f"Tasks due today: {len(due_today)}")
     return due_today, today
 
 
 # ================================
-# Step 3: 检查 Notion 中是否已存在（去重）
+# Step 2: Get existing Notion tasks (for deduplication)
 # ================================
 def get_existing_notion_tasks(notion):
-    print("正在读取 Notion 数据库中已有任务（用于去重）...")
+    print("Checking existing Notion tasks...")
     existing_titles = set()
 
-    results = notion.databases.query(database_id=NOTION_DATABASE_ID)
-    for page in results.get("results", []):
-        try:
-            title = page["properties"]["Name"]["title"][0]["text"]["content"]
-            existing_titles.add(title)
-        except (KeyError, IndexError):
-            pass
+    try:
+        results = notion.databases.query(database_id=NOTION_DATABASE_ID)
+        for page in results.get("results", []):
+            try:
+                title = page["properties"]["Name"]["title"][0]["text"]["content"]
+                existing_titles.add(title)
+            except (KeyError, IndexError, TypeError):
+                pass
+    except Exception as e:
+        print(f"Warning: Could not fetch existing Notion tasks: {e}")
 
-    print(f"✅ Notion 中已有 {len(existing_titles)} 条任务")
+    print(f"Existing Notion tasks: {len(existing_titles)}")
     return existing_titles
 
 
 # ================================
-# Step 4: 写入 Notion
+# Step 3: Sync tasks to Notion
 # ================================
-def sync_to_notion(tasks, today, notion, existing_titles):
-    print("开始同步到 Notion...")
+def sync_to_notion(tasks, today, existing_titles):
+    notion = Client(auth=NOTION_TOKEN)
     synced_count = 0
     skipped_count = 0
 
     for task in tasks:
-        title = task.get("title", "（无标题）")
+        title = task.get("title", "Untitled")
+        project_id = task.get("projectId", "")
+        priority = task.get("priority", 0)  # 0=none, 1=low, 3=medium, 5=high
 
-        # 去重：已存在则跳过
+        # Skip if already in Notion
         if title in existing_titles:
-            print(f"  ⏭️  跳过（已存在）: {title}")
+            print(f"  ⊘ Skipped (already exists): {title}")
             skipped_count += 1
             continue
 
-        # 获取任务优先级（滴答清单：0=无, 1=低, 3=中, 5=高）
-        priority_map = {0: "无", 1: "低", 3: "中", 5: "高"}
-        priority = priority_map.get(task.get("priority", 0), "无")
-
-        # 获取任务备注
-        content = task.get("content", "")
+        # Map priority
+        priority_map = {
+            0: "None",
+            1: "Low",
+            3: "Medium",
+            5: "High"
+        }
+        priority_label = priority_map.get(priority, "None")
 
         try:
             notion.pages.create(
                 parent={"database_id": NOTION_DATABASE_ID},
                 properties={
-                    "Name": {
-                        "title": [{"text": {"content": title}}]
-                    },
-                    "Due Date": {
-                        "date": {"start": today}
-                    },
-                    "Priority": {
-                        "select": {"name": priority}
-                    },
-                    "Status": {
-                        "select": {"name": "待完成"}
-                    },
-                    "Notes": {
-                        "rich_text": [{"text": {"content": content[:2000]}}]  # Notion 限制 2000 字符
-                    }
+                    "Name": {"title": [{"text": {"content": title}}]},
+                    "Due Date": {"date": {"start": today}},
+                    "Priority": {"select": {"name": priority_label}},
                 }
             )
-            print(f"  ✅ 已同步: {title}")
+            print(f"  ✓ Synced: {title}")
             synced_count += 1
-
         except Exception as e:
-            print(f"  ❌ 同步失败: {title}，错误: {e}")
+            print(f"  ✗ Failed to sync '{title}': {e}")
 
-    print(f"\n🎉 同步完成！新增 {synced_count} 条，跳过 {skipped_count} 条")
+    return synced_count, skipped_count
 
 
 # ================================
-# 主函数
+# Main
 # ================================
 def main():
-    # 检查环境变量
-    missing = []
-    if not DIDA_USERNAME:
-        missing.append("DIDA_USERNAME")
-    if not DIDA_PASSWORD:
-        missing.append("DIDA_PASSWORD")
-    if not NOTION_TOKEN:
-        missing.append("NOTION_TOKEN")
-    if not NOTION_DATABASE_ID:
-        missing.append("NOTION_DATABASE_ID")
+    print("\n" + "=" * 50)
+    print("Dida365 to Notion Sync (OAuth2)")
+    print("=" * 50 + "\n")
 
-    if missing:
-        raise Exception(f"缺少环境变量: {', '.join(missing)}")
+    # Step 1: Get tasks from Dida365
+    try:
+        due_today, today = get_due_today_tasks()
+    except Exception as e:
+        print(f"Error fetching tasks: {e}")
+        sys.exit(1)
 
-    # 初始化 Notion 客户端
-    notion = Client(auth=NOTION_TOKEN)
-
-    # 执行同步流程
-    session, token = login_dida()
-    tasks, today = get_due_today_tasks(session, token)
-
-    if not tasks:
-        print("📭 今日没有截止任务，无需同步")
+    if not due_today:
+        print("\nNo tasks due today. Exiting.")
         return
 
-    existing_titles = get_existing_notion_tasks(notion)
-    sync_to_notion(tasks, today, notion, existing_titles)
+    # Step 2: Initialize Notion client and check existing tasks
+    try:
+        notion = Client(auth=NOTION_TOKEN)
+        existing_titles = get_existing_notion_tasks(notion)
+    except Exception as e:
+        print(f"Error connecting to Notion: {e}")
+        sys.exit(1)
+
+    # Step 3: Sync to Notion
+    print("\nSyncing tasks to Notion...\n")
+    synced, skipped = sync_to_notion(due_today, today, existing_titles)
+
+    # Summary
+    print("\n" + "=" * 50)
+    print(f"Sync completed!")
+    print(f"  Synced: {synced}")
+    print(f"  Skipped (already exists): {skipped}")
+    print(f"  Total: {synced + skipped}")
+    print("=" * 50 + "\n")
 
 
 if __name__ == "__main__":
