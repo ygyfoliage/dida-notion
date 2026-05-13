@@ -26,4 +26,5 @@ jobs:
           DIDA_ACCESS_TOKEN: ${{ secrets.DIDA_ACCESS_TOKEN }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          USE_PROXY: "true"
         run: python sync.py
