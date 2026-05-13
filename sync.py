@@ -7,6 +7,8 @@ from datetime import date
 from notion_client import Client
 import os
 import sys
+import random
+import time
 
 # ================================
 # Configuration from environment variables
@@ -14,6 +16,15 @@ import sys
 DIDA_ACCESS_TOKEN = os.environ.get("DIDA_ACCESS_TOKEN")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
+USE_PROXY = os.environ.get("USE_PROXY", "true").lower() == "true"
+
+# Free proxy pool sources
+PROXY_SOURCES = [
+    "https://www.proxy-list.download/api/v1/get?type=http",  # Proxy-List.Download
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",  # GitHub proxy list
+]
+
+proxy_list = []
 
 # Validate required secrets
 if not all([DIDA_ACCESS_TOKEN, NOTION_TOKEN, NOTION_DATABASE_ID]):
@@ -22,6 +33,83 @@ if not all([DIDA_ACCESS_TOKEN, NOTION_TOKEN, NOTION_DATABASE_ID]):
     print(f"  NOTION_TOKEN: {bool(NOTION_TOKEN)}")
     print(f"  NOTION_DATABASE_ID: {bool(NOTION_DATABASE_ID)}")
     sys.exit(1)
+
+# ================================
+# Proxy management
+# ================================
+def fetch_proxies():
+    """Fetch free proxies from multiple sources"""
+    global proxy_list
+    print("Fetching free proxies...")
+    
+    for source in PROXY_SOURCES:
+        try:
+            resp = requests.get(source, timeout=5, verify=False)
+            if resp.status_code == 200:
+                lines = resp.text.strip().split('\n')
+                for line in lines[:20]:  # Take first 20 proxies
+                    line = line.strip()
+                    if line and ':' in line:
+                        proxy_list.append(f"http://{line}")
+                print(f"Fetched {len(lines)} proxies from {source}")
+                break
+        except Exception as e:
+            print(f"Failed to fetch from {source}: {e}")
+            continue
+    
+    if proxy_list:
+        print(f"Total proxies available: {len(proxy_list)}")
+    else:
+        print("Warning: No proxies fetched, will try without proxy")
+    
+    return proxy_list
+
+
+def get_random_proxy():
+    """Get a random proxy from the list"""
+    if not proxy_list:
+        return None
+    return random.choice(proxy_list)
+
+
+def make_request_with_retry(url, method="get", headers=None, data=None, params=None, max_retries=3):
+    """Make HTTP request with proxy and retry logic"""
+    for attempt in range(max_retries):
+        try:
+            proxy = get_random_proxy() if USE_PROXY else None
+            proxies = {"http": proxy, "https": proxy} if proxy else {}
+            
+            if proxy:
+                print(f"Attempt {attempt + 1}: Using proxy {proxy}")
+            
+            if method == "get":
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    proxies=proxies,
+                    verify=False,
+                    timeout=10
+                )
+            else:  # post
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    data=data,
+                    proxies=proxies,
+                    verify=False,
+                    timeout=10
+                )
+            
+            return resp
+        except Exception as e:
+            print(f"Request failed (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)  # Wait before retry
+            continue
+    
+    return None
+
 
 # ================================
 # Step 1: Get tasks from Dida365 using OAuth2
@@ -37,11 +125,10 @@ def get_due_today_tasks():
     }
 
     try:
-        resp = requests.get(
+        resp = make_request_with_retry(
             "https://api.dida365.com/api/v2/batch/check/0",
-            headers=headers,
-            verify=False,
-            timeout=10
+            method="get",
+            headers=headers
         )
     except requests.exceptions.RequestException as e:
         print(f"Network error: {e}")
@@ -148,8 +235,14 @@ def sync_to_notion(tasks, today, existing_titles):
 # ================================
 def main():
     print("\n" + "=" * 50)
-    print("Dida365 to Notion Sync (OAuth2)")
+    print("Dida365 to Notion Sync (OAuth2 + Proxy)")
     print("=" * 50 + "\n")
+    
+    # Fetch proxies if enabled
+    if USE_PROXY:
+        fetch_proxies()
+    else:
+        print("Proxy disabled")
 
     # Step 1: Get tasks from Dida365
     try:
@@ -184,4 +277,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Suppress SSL warnings
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
     main()
